@@ -1,0 +1,594 @@
+---Create Schema and load cleaned data---
+create schema if not exists v_clean_trips;
+set search_path to v_clean_trips;
+select * from v_clean_trips.safari_connect_clean;
+
+alter table v_clean_trips.safari_connect_clean
+    alter column departure_date type date using departure_date::date;
+
+-- ---------------------------------------------------------------------
+-- STEP 0: THE POPULATION 
+-- ---------------------------------------------------------------------
+-- Realised revenue = Completed only           = 227,810  (253 bookings)
+-- Lost revenue     = Cancelled + No Show      =  32,150  ( 35 bookings)
+-- Booked value     = everything               = 259,960  (288 bookings)
+
+select booking_status,
+       count(*)        as bookings,
+       sum(total_fare) as value
+from safari_connect_clean
+group by booking_status
+order by bookings desc;
+
+
+-- =====================================================================
+-- QUESTION 1 — ROUTE ANALYSIS
+-- Which routes earn most? Most popular? Most efficient per seat?
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 1A,B — Revenue, bookings and efficiency by route
+-- ---------------------------------------------------------------------
+-- LEVEL 1 was just: SELECT route_code, SUM(total_fare) ... GROUP BY 1
+-- LEVEL 2 added COUNT(*) and SUM(seats_booked) so the three measures
+--         sit side by side — that is where the finding lives.
+-- LEVEL 3 (below) adds the readable label and revenue per seat.
+select
+    route_code,    
+    route_from || ' - ' || route_to  as route,         -- || is string concatenation 
+    count(*)                         as bookings,      -- rows = bookings
+    sum(seats_booked)                as seats_sold,    -- passengers
+    sum(total_fare)                  as revenue,
+    round(sum(total_fare)::numeric / sum(seats_booked), 0) as revenue_per_seat   -- ::NUMERIC forces decimal division.
+from safari_connect_clean
+where booking_status = 'Completed'
+group by route_code, route_from, route_to
+order by revenue desc;
+
+-- RT001 Nairobi-Mombasa  51,600 · 26 bookings · 1,259/seat  <- TOP
+-- RT005 Nairobi-Thika     7,620 · 30 bookings ·   123/seat  <- most bookings,least revenue per seat
+-- FINDING: bookings barely vary (20-30 per route) but revenue varies
+-- Demand is flat; revenue is fare value, i.e. distance.
+
+
+-- ---------------------------------------------------------------------
+-- 1C — Rank routes and show share of company revenue ( using CTE + 2 windows)
+-- ---------------------------------------------------------------------
+---CTE----
+select route_code,
+       route_from || ' - ' || route_to as route,
+       count(*)        as bookings,
+       sum(total_fare) as revenue
+from safari_connect_clean
+where booking_status = 'Completed'
+group by route_code, route_from, route_to
+order by revenue desc;
+
+---wrapping---
+with route_revenue as (
+    select route_code,
+           route_from || ' - ' || route_to as route,
+           count(*)        as bookings,
+           sum(total_fare) as revenue
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by route_code, route_from, route_to
+)
+select
+    route_code,
+    route,
+    bookings,
+    revenue,
+    rank() over (order by revenue desc) as revenue_rank,  -- Rank every route against every other route.
+    round(revenue * 100.0 / sum(revenue) over (), 1) as pct_of_total 
+from route_revenue
+order by revenue_rank;
+
+-- ---------------------------------------------------------------------
+-- 1D — Vehicle type performance
+-- ---------------------------------------------------------------------
+select
+    vehicle_type,
+    count(*)                   as bookings,
+    sum(seats_booked)          as seats_sold,
+    sum(total_fare)            as revenue,
+    round(avg(trip_rating), 2) as avg_rating
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by vehicle_type
+order by revenue desc;
+
+-- Matatu 87,925 · Bus 84,555 · Minibus 55,330
+-- Revenue tracks FLEET SIZE (3 matatus, 3 buses, 2 minibuses), no
+-- type is outperforming. But minibuses have the best rating (3.71).
+-- "highest revenue", NOT "most profitable" 
+
+
+-- =====================================================================
+-- QUESTION 2 — DRIVER PERFORMANCE
+-- Who are the best drivers? Does rating affect satisfaction?
+--- Show: driver_name, total_trips, total_seats_carried, total_revenue,
+--       avg_trip_rating, driver_rating. Order by total_revenue desc.
+
+select driver_name,
+       count(booking_id)          as total_trips,
+       sum(seats_booked)          as total_seats_carried,
+       sum(total_fare)            as total_revenue,
+       count(trip_rating)         as trips_rated,
+       round(avg(trip_rating), 2) as avg_trip_rating,
+       max(driver_rating)         as driver_rating
+from safari_connect_clean
+where booking_status = 'Completed'
+group by driver_name
+order by total_revenue desc;
+
+-- Isaac Korir    3.8 · 33 trips · 33,045 · passenger 3.39  <- top revenue
+-- Hassan Abdi    4.1 · 30 trips · 27,575 · passenger 3.90  <- top rated
+-- Moses Kipchoge 4.8 · 30 trips · 26,630 · passenger 3.19  <- highest platform rating,LOWEST passenger
+
+
+-- ---------------------------------------------------------------------
+-- 2B — Rank drivers overall AND within vehicle type (PARTITION BY)
+-- ---------------------------------------------------------------------
+----Using a CTE for driver totals, rank drivers overall by revenue AND within their vehicle type using PARTITION BY vehicle_type.
+
+--  CTE---
+select driver_name,
+       vehicle_type,
+       count(*)                   as total_trips,
+       sum(total_fare)            as total_revenue,
+       round(avg(trip_rating), 2) as avg_passenger_trip_rating
+from v_clean_trips.safari_connect_clean 
+group by driver_name, vehicle_type;
+
+-- driver totals via CTE, ranked overall and within vehicle type
+with driver_totals as (
+    select driver_name,
+           vehicle_type,
+           count(*)                   as total_trips,
+           sum(total_fare)            as total_revenue,
+           round(avg(trip_rating), 2) as avg_passenger_trip_rating
+    from v_clean_trips.safari_connect_clean 
+    group by driver_name, vehicle_type
+)
+select driver_name,
+       vehicle_type,
+       total_trips,
+       total_revenue,
+       avg_passenger_trip_rating,
+       rank() over (order by total_revenue desc) as overall_rank,
+       rank() over (partition by vehicle_type
+                    order by total_revenue desc) as vehicle_rank
+from driver_totals
+order by overall_rank;
+
+-- CHECK: 8 rows (NOT 9). Three 1s in rank_in_vehicle.
+----One driver operates two vehicles, so we aggregated by driver rather than by driver-and-vehicle."
+
+
+-- ---------------------------------------------------------------------
+-- 2C — Does driver rating predict passenger satisfaction?
+-- ---------------------------------------------------------------------
+-- GROUP BY 1 = "the first item in the SELECT list", i.e. the CASE.
+
+select
+    case
+        when driver_rating >= 4.5 then 'High-rated'
+        else 'Standard'
+    end                         as rating_band,
+    count(distinct driver_name) as drivers,     -- the sample size caveat
+    count(*)                    as trips,
+    count(trip_rating)          as trips_rated,
+    round(avg(trip_rating), 2)  as avg_passenger_rating,
+    sum(total_fare)             as revenue
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by 1
+order by avg_passenger_rating desc;
+
+-- Standard   (<4.5): 5 drivers · 158 trips · 3.62
+-- High-rated (4.5+): 3 drivers ·  95 trips · 3.38
+--It runs BACKWARDS.
+
+
+
+-- =====================================================================
+-- QUESTION 3 — REVENUE TRENDS
+-- Month by month. Best and worst months. Growing or declining?
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 3A — Month-over-month change (CTE + LAG)
+-- ---------------------------------------------------------------------
+-- LEVEL 1: The CTE.
+----Checking type---
+select column_name, data_type
+from information_schema.columns
+where table_name = 'safari_connect_clean'
+  and column_name in ('departure_date','total_fare','seats_booked','trip_rating');
+  
+---CTE---
+select to_char(departure_date::date, 'YYYY-MM') as month,
+       count(*)        as bookings,
+       sum(total_fare) as revenue
+from clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by 1 order by 1;
+
+--Monthly revenue with month-over-month change (CTE + LAG)
+
+with monthly as (
+    select to_char(departure_date::date, 'YYYY-MM') as month,
+           count(*)        as bookings,
+           sum(total_fare) as revenue
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by 1
+)
+select
+    month,
+    bookings,
+    revenue,
+    lag(revenue) over (order by month) as prev_month,
+    revenue - lag(revenue) over (order by month) as change_kes,
+    round((revenue - lag(revenue) over (order by month)) * 100.0
+          / nullif(lag(revenue) over (order by month), 0), 1) as change_pct
+from monthly
+order by month;
+
+-- BEST  month: 2024-10 = 23,330
+-- WORST month: 2024-04 = 13,320   (August has the biggest DROP, -39.6%,but April has the lowest revenue)
+--  2025 -01 excluded from the trend because it is not a business event. it has THREE bookings
+-- across FOUR DAYS (1-4 Jan) because that is where the export ends                               
+
+-- ---------------------------------------------------------------------
+-- 3A(ii) 
+-- ---------------------------------------------------------------------
+-- LAG written three times .
+-- Chain CTEs with a comma.
+
+with monthly as (
+    select to_char(departure_date::date, 'YYYY-MM') as month,
+           count(*)        as bookings,
+           sum(total_fare) as revenue
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by 1
+),
+with_prev as (
+    select month, bookings, revenue,
+           lag(revenue) over (order by month) as prev_month
+    from monthly
+)
+select month, bookings, revenue, prev_month,
+       revenue - prev_month as change_kes,
+       round((revenue - prev_month) / nullif(prev_month, 0) * 100.0, 1)
+           as change_pct
+from with_prev
+order by month;
+
+
+-- ---------------------------------------------------------------------
+-- 3B — Running total and 3-month moving average
+
+-- ---------------------------------------------------------------------
+with monthly as (
+    select to_char(departure_date::date, 'YYYY-MM') as month,
+           sum(total_fare) as revenue
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by 1
+)
+select
+    month,
+    revenue,    
+    sum(revenue) over (order by month) as running_total,
+    -- An explicit frame: this row plus the two before it.
+    round(avg(revenue) over (order by month
+                             rows between 2 preceding and current row), 0)
+        as rolling_3mo
+from monthly
+order by month;
+
+--the rolling_3mo to be put on the dashboard
+
+
+
+-- ---------------------------------------------------------------------
+-- 3C — Best and worst 3 months 
+-- ---------------------------------------------------------------------
+-- TWO CTEs.
+with monthly as (
+    select to_char(departure_date::date, 'YYYY-MM') as month,
+           sum(total_fare) as revenue
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+      and departure_date::date < date '2025-01-01'   -- drop the partial month
+    group by 1
+),
+ranked as (
+    select month, revenue,
+           rank() over (order by revenue desc) as best_rank,
+           rank() over (order by revenue asc)  as worst_rank
+    from monthly
+)
+select month, revenue,
+       case when best_rank  <= 3 then 'TOP 3'
+            when worst_rank <= 3 then 'BOTTOM 3' end as category
+from ranked
+where best_rank <= 3 or worst_rank <= 3
+order by revenue desc;
+
+-- TOP 3:    Oct 23,330 · Jul 22,855 · Sep 21,185
+-- BOTTOM 3: Feb 15,440 · Aug 13,800 · Apr 13,320
+
+
+-- ---------------------------------------------------------------------
+-- 3D — Monthly revenue by route (a pivot)
+-- ---------------------------------------------------------------------
+-- FILTER (WHERE ...) applies the aggregate only to matching rows.
+-- One FILTER per output column: GROUP BY makes the rows, FILTER makes the columns. 
+-- The older portable form is SUM(CASE WHEN ... THEN x ELSE 0 END).
+-- Difference: FILTER gives NULL when nothing matched, ELSE 0 gives 0.
+
+select
+    to_char(departure_date::date, 'YYYY-MM') as month,
+    sum(total_fare) filter (where route_code = 'RT001') as rt001_mombasa,
+    sum(total_fare) filter (where route_code = 'RT002') as rt002_kisumu,
+    sum(total_fare) filter (where route_code = 'RT004') as rt004_eldoret,
+    sum(total_fare)                                     as all_routes
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by 1
+order by 1;
+
+-- RT001 earns 9,600 in January and ZERO in April. The big routes are
+-- lumpy month to month — that is most of the apparent volatility.
+
+
+-- ---------------------------------------------------------------------
+-- 3E - : growing or declining?
+-- ---------------------------------------------------------------------
+-- Monthly swings of -40% to +54% on 16-24 bookings a month are SAMPLE
+-- NOISE. Do not tell a story from one pair of months. Compare halves.
+select
+    case when departure_date::date < date '2024-07-01' then 'H1 2024'
+         else 'H2 2024' end as half,
+    count(*)        as bookings,
+    sum(total_fare) as revenue
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+  and departure_date::date < date '2025-01-01'
+group by 1
+order by 1;
+
+-- H1 = 104,280 · H2 = 121,845 -> +16.8%
+-- Revenue is growing modestly — H2 was 16.8% ahead of H1. 
+
+
+-- =====================================================================
+-- QUESTION 4 — PASSENGER INSIGHTS
+-- Where from? What class? Are they satisfied?
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 4A — Top origin cities
+-- ---------------------------------------------------------------------
+select
+    passenger_city,
+    count(*)                        as bookings,
+    sum(seats_booked)               as passengers,
+    sum(total_fare)                 as revenue,
+    round(avg(fare_per_seat), 2)    as avg_fare,
+    round(100.0 * count(*) / sum(count(*)) over (), 1) as pct_of_bookings
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by passenger_city
+having count(*) >= 5
+order by bookings desc;
+
+-- Nairobi 113 of 253 = 45%. 
+
+-- ---------------------------------------------------------------------
+-- 4B — Gender and seat class split
+-- ---------------------------------------------------------------------
+select
+    passenger_gender,
+    count(*)                                               as bookings,
+    count(*) filter (where seat_class = 'Economy')         as economy,
+    count(*) filter (where seat_class = 'Business')        as business,
+    sum(total_fare) filter (where seat_class = 'Business') as business_rev,
+    round(100.0 * count(*) filter (where seat_class = 'Business')
+                / count(*), 1)                             as pct_business
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by passenger_gender;
+
+-- Female 137 (29 business) · Male 116 (23 business) · ~80/20 economy
+-- gender  is near-even; 
+
+
+-- ---------------------------------------------------------------------
+-- 4C — Satisfaction breakdown
+-- ---------------------------------------------------------------------
+with sat as (
+    select
+        case
+            when trip_rating >= 4 then 'Satisfied'
+            when trip_rating  = 3 then 'Neutral'
+            when trip_rating <= 2 then 'Unsatisfied'
+            else 'Not rated'          --  NULL
+        end      as satisfaction,
+        count(*) as trips
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by 1
+)
+select satisfaction, trips,
+       round(trips * 100.0 / sum(trips) over (), 1) as pct
+from sat
+order by trips desc;
+
+-- Satisfied 117 (46%) · Neutral 73 (29%) · Unsatisfied 49 (19%) · Not rated 14 (6%)
+
+-- ---------------------------------------------------------------------
+-- 4D — Passenger spend quartiles (NTILE)
+-- ---------------------------------------------------------------------
+with passenger_spend as (
+    select passenger_name,
+           count(*)        as trips,
+           sum(total_fare) as total_spent
+    from v_clean_trips.safari_connect_clean
+    where booking_status = 'Completed'
+    group by passenger_name
+)
+select
+    passenger_name, trips, total_spent,       -- NTILE(4) sorts the rows and splits them into 4 equal-sized buckets. 
+    ntile(4) over (order by total_spent) as spend_quartile,
+    case ntile(4) over (order by total_spent)
+         when 4 then 'Top Spender'
+         when 3 then 'Above Average'
+         when 2 then 'Below Average'
+         else        'Low Spender'
+    end as segment
+from passenger_spend
+order by total_spent desc;
+
+-- only 23 distinct passenger NAMES across 253 trips,
+
+-- =====================================================================
+-- QUESTION 5 — CANCELLATIONS
+--- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 5A — Overall status breakdown
+-- ---------------------------------------------------------------------
+select
+    booking_status,
+    count(*)        as bookings,
+    sum(total_fare) as value,
+    round(100.0 * count(*) / sum(count(*)) over (), 1) as pct
+from v_clean_trips.safari_connect_clean
+group by booking_status
+order by bookings desc;
+
+-- Completed 253 · Cancelled 21 · No Show 14
+-- 35 of 288 = 12.2% overall failure rate
+
+
+-- ---------------------------------------------------------------------
+-- 5B — Cancellation rate and revenue lost, by route
+-- ---------------------------------------------------------------------
+select
+    route_code,
+    route_from || ' - ' || route_to as route,
+    count(*)                                                   as all_bookings,
+    count(*) filter (where booking_status = 'Cancelled')       as cancelled,
+    count(*) filter (where booking_status = 'No Show')         as no_show,
+    round(100.0 * count(*) filter (where booking_status <> 'Completed')
+                / count(*), 1)                                 as failure_rate_pct,
+    sum(total_fare) filter (where booking_status <> 'Completed') as revenue_lost
+from v_clean_trips.safari_connect_clean
+group by route_code, route_from, route_to
+order by revenue_lost desc;
+
+-- WORST BY RATE:  RT006 Mombasa-Malindi  18.5%
+-- WORST BY MONEY: RT001 Nairobi-Mombasa  KES 10,800  
+-- Rate and value point at different routes because RT001's fares are high.
+
+-- ---------------------------------------------------------------------
+-- 5C — WHY they fail: the recommendation with evidence behind it
+-- ---------------------------------------------------------------------
+select
+    payment_method,
+    count(*)                                                     as bookings,
+    count(*) filter (where booking_status <> 'Completed')        as failed,
+    round(100.0 * count(*) filter (where booking_status <> 'Completed')
+                / count(*), 1)                                   as failure_rate_pct,
+    sum(total_fare) filter (where booking_status <> 'Completed') as revenue_lost
+from v_clean_trips.safari_connect_clean
+group by payment_method
+order by failure_rate_pct desc;
+
+-- Cash   21.6% fail · M-Pesa 9.5% · Card 3.8%
+-- RECOMMENDATION: require a deposit or prepayment on cash bookings,starting with RT001.
+
+
+-- =====================================================================
+-- QUESTION 6 — OPERATIONAL PATTERNS
+-- Busiest days and times. Where do we add vehicles?
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 6A — By day of week
+-- ---------------------------------------------------------------------
+
+
+select
+    extract(dow from departure_date)     as day_num,   -- 0=Sun .. 6=Sat
+    trim(to_char(departure_date, 'Day')) as day_name,
+    count(*)                             as bookings,
+    sum(seats_booked)                    as passengers,
+    sum(total_fare)                      as revenue,
+    round(avg(total_fare), 0)            as avg_booking_value
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by 1, 2
+order by day_num;
+
+-- Monday    46 bookings · 47,750  <- highest REVENUE
+-- Wednesday 53 bookings · 41,290  <- most BOOKINGS
+-- Sunday    11 bookings ·  8,835  <- a FIFTH of Monday
+-- Mon-Thu is ~76% of all bookings. Same volume-vs-value lesson as Q1.
+
+
+-- ---------------------------------------------------------------------
+-- 6B — By departure time
+-- ---------------------------------------------------------------------
+select
+    departure_time,
+    count(*)          as bookings,
+    sum(seats_booked) as passengers,
+    sum(total_fare)   as revenue,
+    rank() over (order by sum(total_fare) desc) as revenue_rank
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by departure_time
+order by departure_time;
+
+
+-- 19:00 = 22,240 (highest) · 13:00 = 12,045 (lowest)
+-- Demand is FLAT — every slot runs 18-25 bookings. 
+
+
+-- ---------------------------------------------------------------------
+-- 6C — Seat utilisation
+-- ---------------------------------------------------------------------
+select
+    vehicle_type,
+    count(*)                    as trips,
+    sum(seats_booked)           as total_seats,
+    round(avg(seats_booked), 2) as avg_seats_per_booking
+from v_clean_trips.safari_connect_clean
+where booking_status = 'Completed'
+group by vehicle_type
+order by avg_seats_per_booking desc;
+
+-- Bus 1.93 · Minibus 1.72 · Matatu 1.69
+-- THE REAL FINDING: average booking is 1.8 seats. 
+--- So capacity planning is about FREQUENCY (more departures), not bigger vehicles.
+
+
+-- =====================================================================
+-- VALIDATION 
+-- =====================================================================
+select
+    (select count(*) from v_clean_trips.safari_connect_clean)                          as all_rows,
+    (select count(*) from v_clean_trips.safari_connect_clean
+      where booking_status = 'Completed')                                as completed,
+    (select sum(total_fare) from v_clean_trips.safari_connect_clean
+      where booking_status = 'Completed')                                as realised_revenue,
+    (select sum(total_fare) from v_clean_trips.safari_connect_clean
+      where booking_status <> 'Completed')                               as lost_revenue,
+    (select min(departure_date) from v_clean_trips.safari_connect_clean)               as first_trip,
+    (select max(departure_date) from v_clean_trips.safari_connect_clean)               as last_trip;
